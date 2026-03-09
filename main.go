@@ -41,23 +41,29 @@ type Reply struct {
 	Msg string `json:"msg"`
 }
 
-func fetchPage(pageIndex int) ([]Player, error) {
+// Product defines a mahjong game type with its productId and sheet name.
+type Product struct {
+	ProductID string
+	SheetName string
+}
+
+func fetchPage(productId string, pageIndex int) (*Reply, []Player, error) {
 	var reply Reply
 	_, err := requests.Get(
 		"https://wxapi.mahjonget.com/cert/open/score/page",
 		requests.ParamPairs(
-			"productId", "1739485995675418624",
+			"productId", productId,
 			"pageIndex", strconv.Itoa(pageIndex),
 			"pageSize", "100",
 		),
 		requests.ToJSON(&reply),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if !reply.Success {
-		return nil, fmt.Errorf("API error: %s", reply.Msg)
+		return nil, nil, fmt.Errorf("API error: %s", reply.Msg)
 	}
 
 	var players []Player
@@ -70,86 +76,29 @@ func fetchPage(pageIndex int) ([]Player, error) {
 			Score:    item.Score,
 		})
 	}
-	return players, nil
+	return &reply, players, nil
 }
 
-func saveToExcel(players []Player, filename string) error {
-	f := excelize.NewFile()
-	defer f.Close()
-
-	// Create a new sheet
-	index, err := f.NewSheet("Players")
+// fetchAllPlayers fetches all pages for a given productId.
+func fetchAllPlayers(productId string) ([]Player, error) {
+	firstReply, firstPagePlayers, err := fetchPage(productId, 1)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to fetch first page: %v", err)
 	}
 
-	// Set headers
-	headers := []string{"Ranking", "Name", "UID", "CertName", "Score"}
-	for col, header := range headers {
-		cell, _ := excelize.CoordinatesToCellName(col+1, 1)
-		f.SetCellValue("Players", cell, header)
-	}
-
-	// Fill data
-	for row, player := range players {
-		f.SetCellValue("Players", fmt.Sprintf("A%d", row+2), player.Ranking)
-		f.SetCellValue("Players", fmt.Sprintf("B%d", row+2), player.Name)
-		f.SetCellValue("Players", fmt.Sprintf("C%d", row+2), player.UID)
-		f.SetCellValue("Players", fmt.Sprintf("D%d", row+2), player.CertName)
-		f.SetCellValue("Players", fmt.Sprintf("E%d", row+2), player.Score)
-	}
-
-	// Set active sheet
-	f.SetActiveSheet(index)
-
-	// Delete Sheet1
-	f.DeleteSheet("Sheet1")
-
-	// Save file
-	if err := f.SaveAs(filename); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func main() {
-	// Fetch first page to get total page count
-	firstPagePlayers, err := fetchPage(1)
-	if err != nil {
-		log.Fatalf("Failed to fetch first page: %v", err)
-	}
-
-	// Get total page count from API
-	var firstPageReply Reply
-	_, err = requests.Get(
-		"https://wxapi.mahjonget.com/cert/open/score/page",
-		requests.ParamPairs(
-			"productId", "1739485995675418624",
-			"pageIndex", "1",
-			"pageSize", "100",
-		),
-		requests.ToJSON(&firstPageReply),
-	)
-	if err != nil {
-		log.Fatalf("Failed to get total page count: %v", err)
-	}
-
-	totalPages := firstPageReply.Data.TotalPageCount
+	totalPages := firstReply.Data.TotalPageCount
 	if totalPages <= 0 {
 		totalPages = 1
 	}
 
-	// Collect all players
 	var allPlayers []Player
 	allPlayers = append(allPlayers, firstPagePlayers...)
 
 	log.Printf("Total pages: %d", totalPages)
 	log.Printf("Fetched page 1, players: %d", len(firstPagePlayers))
 
-	// Fetch remaining pages
 	for page := 2; page <= totalPages; page++ {
-		players, err := fetchPage(page)
+		_, players, err := fetchPage(productId, page)
 		if err != nil {
 			log.Printf("Warning: Failed to fetch page %d: %v", page, err)
 			continue
@@ -158,11 +107,70 @@ func main() {
 		log.Printf("Fetched page %d, players: %d", page, len(players))
 	}
 
-	log.Printf("Total players fetched: %d", len(allPlayers))
+	return allPlayers, nil
+}
 
-	// Save to Excel
-	err = saveToExcel(allPlayers, "mahjong_rank.xlsx")
+// writeSheet writes player data to a specific sheet in the Excel file.
+func writeSheet(f *excelize.File, sheetName string, players []Player) error {
+	_, err := f.NewSheet(sheetName)
 	if err != nil {
+		return err
+	}
+
+	// Set headers
+	headers := []string{"Ranking", "Name", "UID", "CertName", "Score"}
+	for col, header := range headers {
+		cell, _ := excelize.CoordinatesToCellName(col+1, 1)
+		f.SetCellValue(sheetName, cell, header)
+	}
+
+	// Fill data
+	for row, player := range players {
+		f.SetCellValue(sheetName, fmt.Sprintf("A%d", row+2), player.Ranking)
+		f.SetCellValue(sheetName, fmt.Sprintf("B%d", row+2), player.Name)
+		f.SetCellValue(sheetName, fmt.Sprintf("C%d", row+2), player.UID)
+		f.SetCellValue(sheetName, fmt.Sprintf("D%d", row+2), player.CertName)
+		f.SetCellValue(sheetName, fmt.Sprintf("E%d", row+2), player.Score)
+	}
+
+	return nil
+}
+
+func main() {
+	products := []Product{
+		{ProductID: "1739485995675418624", SheetName: "国标麻将(MCR)"},
+		{ProductID: "1739484964883267584", SheetName: "立直麻将(RCR)"},
+		{ProductID: "1739484939113463808", SheetName: "四川麻将(SBR)"},
+	}
+
+	f := excelize.NewFile()
+	defer f.Close()
+
+	for _, product := range products {
+		log.Printf("Fetching data for %s (productId: %s)...", product.SheetName, product.ProductID)
+
+		players, err := fetchAllPlayers(product.ProductID)
+		if err != nil {
+			log.Fatalf("Failed to fetch data for %s: %v", product.SheetName, err)
+		}
+
+		log.Printf("Total players fetched for %s: %d", product.SheetName, len(players))
+
+		if err := writeSheet(f, product.SheetName, players); err != nil {
+			log.Fatalf("Failed to write sheet %s: %v", product.SheetName, err)
+		}
+	}
+
+	// Set the first product sheet as active
+	if index, err := f.GetSheetIndex(products[0].SheetName); err == nil {
+		f.SetActiveSheet(index)
+	}
+
+	// Delete default Sheet1
+	f.DeleteSheet("Sheet1")
+
+	// Save file
+	if err := f.SaveAs("mahjong_rank.xlsx"); err != nil {
 		log.Fatalf("Failed to save Excel file: %v", err)
 	}
 
